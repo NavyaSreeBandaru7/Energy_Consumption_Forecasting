@@ -1,0 +1,586 @@
+name: Energy Forecasting Platform CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+env:
+  PYTHON_VERSION: 3.11
+  NODE_VERSION: 18
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: energy-forecasting-platform
+
+jobs:
+  # Code Quality and Security
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install black flake8 mypy bandit safety isort
+        pip install -r requirements.txt
+    
+    - name: Code formatting with Black
+      run: black --check --diff .
+    
+    - name: Linting with flake8
+      run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+    
+    - name: Type checking with mypy
+      run: mypy --ignore-missing-imports .
+    
+    - name: Security check with bandit
+      run: bandit -r . -x tests/
+    
+    - name: Dependency vulnerability check
+      run: safety check
+    
+    - name: Import sorting check
+      run: isort --check-only --diff .
+
+  # Unit and Integration Tests
+  test:
+    runs-on: ubuntu-latest
+    needs: code-quality
+    
+    strategy:
+      matrix:
+        python-version: [3.9, 3.10, 3.11]
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_USER: test_user
+          POSTGRES_DB: test_energy_forecasting
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpq-dev
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pytest-xdist pytest-mock
+        python -m spacy download en_core_web_sm
+    
+    - name: Run unit tests
+      env:
+        DB_HOST: localhost
+        DB_PORT: 5432
+        DB_NAME: test_energy_forecasting
+        DB_USER: test_user
+        DB_PASSWORD: test_password
+        REDIS_HOST: localhost
+        REDIS_PORT: 6379
+        ENVIRONMENT: testing
+      run: |
+        pytest tests/test_models.py -v --cov=. --cov-report=xml --cov-report=html -m "not slow"
+    
+    - name: Run integration tests
+      env:
+        DB_HOST: localhost
+        REDIS_HOST: localhost
+        ENVIRONMENT: testing
+      run: |
+        pytest tests/ -v -m "integration" --maxfail=3
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+    
+    - name: Archive test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-${{ matrix.python-version }}
+        path: |
+          htmlcov/
+          pytest-report.xml
+
+  # Performance and Load Testing
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install locust pytest-benchmark
+    
+    - name: Run performance tests
+      run: |
+        pytest tests/ -v -m "slow" --benchmark-only --benchmark-json=benchmark.json
+    
+    - name: Run load tests
+      run: |
+        # Start the application in background
+        python api_server.py &
+        sleep 10
+        
+        # Run load tests
+        locust -f tests/load/locustfile.py --host=http://localhost:8000 \
+               --users=50 --spawn-rate=5 --run-time=60s --headless \
+               --csv=load_test_results
+    
+    - name: Upload performance results
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-results
+        path: |
+          benchmark.json
+          load_test_results*
+
+  # Security Scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: code-quality
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+    
+    - name: OWASP Dependency Check
+      uses: dependency-check/Dependency-Check_Action@main
+      with:
+        project: 'energy-forecasting-platform'
+        path: '.'
+        format: 'JSON'
+        args: >
+          --enableRetired
+          --enableExperimental
+
+  # Docker Build and Push
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Build and push API Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: Dockerfile.api
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/api:${{ steps.meta.outputs.version }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+  # Documentation Build
+  docs-build:
+    runs-on: ubuntu-latest
+    needs: code-quality
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install documentation dependencies
+      run: |
+        pip install sphinx sphinx-rtd-theme myst-parser
+        pip install -r requirements.txt
+    
+    - name: Build documentation
+      run: |
+        cd docs
+        make html
+    
+    - name: Deploy to GitHub Pages
+      if: github.ref == 'refs/heads/main'
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./docs/_build/html
+
+  # Model Training and Validation
+  model-training:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        python -m spacy download en_core_web_sm
+    
+    - name: Train and validate models
+      env:
+        MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      run: |
+        python scripts/train_models.py --validate --save-artifacts
+    
+    - name: Upload model artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: trained-models
+        path: |
+          models/
+          model_metrics.json
+        retention-days: 30
+
+  # Deployment to Staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [docker-build, model-training]
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging.energy-forecasting.com
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Deploy to staging
+      env:
+        KUBE_CONFIG: ${{ secrets.KUBE_CONFIG_STAGING }}
+        DOCKER_IMAGE: ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}:develop
+      run: |
+        echo "$KUBE_CONFIG" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+        
+        # Update deployment with new image
+        kubectl set image deployment/energy-forecasting-app \
+          energy-forecasting-app=$DOCKER_IMAGE -n staging
+        
+        # Wait for rollout to complete
+        kubectl rollout status deployment/energy-forecasting-app -n staging --timeout=300s
+    
+    - name: Run smoke tests
+      run: |
+        sleep 30  # Wait for deployment to be ready
+        curl -f https://staging.energy-forecasting.com/health || exit 1
+        python scripts/smoke_tests.py --env staging
+
+  # Production Deployment
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.event_name == 'release' && github.event.action == 'published'
+    environment:
+      name: production
+      url: https://energy-forecasting.com
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Deploy to production
+      env:
+        KUBE_CONFIG: ${{ secrets.KUBE_CONFIG_PRODUCTION }}
+        DOCKER_IMAGE: ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}:${{ github.event.release.tag_name }}
+      run: |
+        echo "$KUBE_CONFIG" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+        
+        # Blue-green deployment strategy
+        kubectl patch deployment energy-forecasting-app \
+          -p '{"spec":{"template":{"spec":{"containers":[{"name":"energy-forecasting-app","image":"'$DOCKER_IMAGE'"}]}}}}' \
+          -n production
+        
+        # Wait for rollout and health check
+        kubectl rollout status deployment/energy-forecasting-app -n production --timeout=600s
+    
+    - name: Run production health checks
+      run: |
+        python scripts/health_check.py --env production --comprehensive
+    
+    - name: Notify deployment success
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        text: 'Production deployment successful! 🚀'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Database Migration
+  database-migration:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        pip install alembic psycopg2-binary
+    
+    - name: Run database migrations
+      env:
+        DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+      run: |
+        alembic upgrade head
+
+  # Performance Monitoring
+  performance-monitoring:
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: github.event_name == 'release'
+    
+    steps:
+    - name: Performance baseline check
+      run: |
+        # Run automated performance tests against production
+        python scripts/performance_monitor.py --baseline --env production
+    
+    - name: Setup monitoring alerts
+      env:
+        GRAFANA_API_KEY: ${{ secrets.GRAFANA_API_KEY }}
+        PROMETHEUS_URL: ${{ secrets.PROMETHEUS_URL }}
+      run: |
+        python scripts/setup_alerts.py --env production
+
+  # Cleanup
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+    
+    steps:
+    - name: Clean up old Docker images
+      run: |
+        # Keep only the last 10 images
+        docker image prune -af
+    
+    - name: Clean up old artifacts
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const artifacts = await github.rest.actions.listArtifactsForRepo({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            per_page: 100
+          });
+          
+          // Keep only the last 20 artifacts
+          const oldArtifacts = artifacts.data.artifacts
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+            .slice(20);
+          
+          for (const artifact of oldArtifacts) {
+            await github.rest.actions.deleteArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: artifact.id
+            });
+          }
+
+# Workflow notifications
+  notify-failure:
+    runs-on: ubuntu-latest
+    needs: [code-quality, test, security-scan, docker-build]
+    if: failure()
+    
+    steps:
+    - name: Notify on failure
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        text: 'CI/CD Pipeline failed! 🚨'
+        fields: repo,message,commit,author,action,eventName,ref,workflow
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    
+    - name: Create issue on failure
+      if: github.ref == 'refs/heads/main'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `CI/CD Pipeline failure on ${context.ref}`,
+            body: `
+            ## Pipeline Failure Report
+            
+            **Workflow:** ${context.workflow}
+            **Run ID:** ${context.runId}
+            **Commit:** ${context.sha}
+            **Author:** ${context.actor}
+            
+            Please investigate the failure and fix the issues.
+            
+            [View failed run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            `,
+            labels: ['bug', 'ci-cd', 'urgent']
+          });
+
+# Scheduled jobs
+  scheduled-model-retrain:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+    
+    - name: Retrain models
+      env:
+        MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        DATABASE_URL: ${{ secrets.DATABASE_URL_PRODUCTION }}
+      run: |
+        python scripts/scheduled_retrain.py --production
+
+  scheduled-security-scan:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Full security audit
+      run: |
+        pip install safety bandit semgrep
+        safety check --json --output safety-report.json
+        bandit -r . -f json -o bandit-report.json
+        semgrep --config=auto --json --output=semgrep-report.json .
+    
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-audit-reports
+        path: |
+          safety-report.json
+          bandit-report.json
+          semgrep-report.json
+
+# Schedule configurations (add to the top of the file under 'on:')
+# schedule:
+#   - cron: '0 2 * * 1'  # Weekly model retraining (Mondays at 2 AM)
+#   - cron: '0 6 * * *'  # Daily security scans (6 AM UTC)
